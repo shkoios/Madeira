@@ -1,0 +1,93 @@
+name: Export unsigned IPA
+
+on:
+  workflow_run:
+    workflows: [Build IPA]
+    types: [completed]
+    branches: [main]
+  workflow_dispatch:
+    inputs:
+      run_id:
+        description: Successful Build IPA run ID from this repository
+        required: true
+        type: string
+
+permissions:
+  actions: read
+  contents: read
+
+jobs:
+  export:
+    if: github.event_name == 'workflow_dispatch' || github.event.workflow_run.conclusion == 'success'
+    runs-on: macos-26
+    timeout-minutes: 15
+    env:
+      SOURCE_RUN_ID: ${{ inputs.run_id || github.event.workflow_run.id }}
+    steps:
+      - name: Verify source build
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          [[ "$SOURCE_RUN_ID" =~ ^[0-9]+$ ]]
+          mkdir -p export
+          gh api "repos/$GITHUB_REPOSITORY/actions/runs/$SOURCE_RUN_ID" > export/build-run.json
+          python3 - <<'PY'
+          import json, os
+          from pathlib import Path
+          run = json.loads(Path('export/build-run.json').read_text())
+          repo = os.environ['GITHUB_REPOSITORY']
+          assert run['repository']['full_name'] == repo
+          assert run['head_repository']['full_name'] == repo
+          assert run['head_branch'] == 'main'
+          assert run['path'] == '.github/workflows/build.yml'
+          assert run['conclusion'] == 'success'
+          Path('export/BUILD.txt').write_text(
+              f"Source: https://github.com/{repo}/commit/{run['head_sha']}\n"
+              f"Build: {run['html_url']}\n"
+              'Unsigned ARM64 iOS device app. Sign before installing.\n'
+              'Madeira.entitlements preserves the original requested entitlements.\n'
+              'Runtime JIT setup and device testing are separate from this build.\n')
+          PY
+      - uses: actions/download-artifact@v4
+        with:
+          name: Madeira-ipa
+          path: input
+          run-id: ${{ env.SOURCE_RUN_ID }}
+          github-token: ${{ github.token }}
+      - name: Remove ad-hoc signatures and package unsigned IPA
+        run: |
+          set -euo pipefail
+          mkdir staging
+          unzip -q input/Madeira.ipa -d staging
+          app="$PWD/staging/Payload/Madeira.app"
+          test -f "$app/Madeira"
+          test -f "$app/Info.plist"
+          lipo -verify_arch arm64 "$app/Madeira"
+          codesign -d --entitlements :- "$app" > export/Madeira.entitlements
+          plutil -lint export/Madeira.entitlements
+          while IFS= read -r -d '' binary; do
+            if file -b "$binary" | grep -q 'Mach-O'; then
+              if codesign -d "$binary" >/dev/null 2>&1; then
+                codesign --remove-signature "$binary"
+              fi
+              if codesign -d "$binary" >/dev/null 2>&1; then
+                echo "Signature remains: $binary" >&2
+                exit 1
+              fi
+            fi
+          done < <(find "$app" -type f -print0)
+          find "$app" -type d -name _CodeSignature -prune -exec rm -rf {} +
+          find "$app" -type f -name embedded.mobileprovision -delete
+          printf 'Minimum iOS: ' >> export/BUILD.txt
+          plutil -extract MinimumOSVersion raw -o - "$app/Info.plist" >> export/BUILD.txt
+          (cd staging && /usr/bin/zip -qry ../export/Madeira-unsigned.ipa Payload)
+          unzip -tq export/Madeira-unsigned.ipa
+          (cd export && shasum -a 256 Madeira-unsigned.ipa > SHA256SUMS)
+          cat export/BUILD.txt >> "$GITHUB_STEP_SUMMARY"
+      - uses: actions/upload-artifact@v4
+        with:
+          name: Madeira-unsigned-ipa
+          path: export/
+          if-no-files-found: error
+          retention-days: 14
