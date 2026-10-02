@@ -1,0 +1,1250 @@
+diff --git a/.github/workflows/ios18-jit.yml b/.github/workflows/ios18-jit.yml
+new file mode 100644
+index 0000000..2200201
+--- /dev/null
++++ b/.github/workflows/ios18-jit.yml
+@@ -0,0 +1,49 @@
++name: iOS 18 JIT validation and unsigned app
++on:
++  workflow_dispatch:
++    inputs:
++      build_app:
++        description: 'Attempt app packaging (native archives must already be built)'
++        type: boolean
++        default: false
++permissions:
++  contents: read
++jobs:
++  validate:
++    runs-on: macos-15
++    timeout-minutes: 30
++    steps:
++      - uses: actions/checkout@v4
++        with:
++          persist-credentials: false
++      - name: Test legacy VM error handling
++        run: |
++          cc -std=c11 -Wall -Wextra -Werror tests/host/jit-legacy-test.c -o "$RUNNER_TEMP/jit-test"
++          "$RUNNER_TEMP/jit-test"
++      - name: Compile allocator against the iPhone SDK
++        run: |
++          mkdir -p artifacts
++          set -o pipefail
++          xcrun --sdk iphoneos clang -target arm64-apple-ios18.5 \
++            -isysroot "$(xcrun --sdk iphoneos --show-sdk-path)" \
++            -fsyntax-only app/Madeira/JITAllocator.c 2>&1 | tee artifacts/allocator-compile.log
++      - name: Parse changed Swift sources
++        run: |
++          xcrun swiftc -frontend -parse -target arm64-apple-ios18.5 \
++            -sdk "$(xcrun --sdk iphoneos --show-sdk-path)" \
++            app/Madeira/StikJITHelper.swift app/Madeira/ContentView.swift
++      - name: Report native build inputs
++        if: always()
++        run: |
++          python3 build/ci/check-app-inputs.py > artifacts/native-inputs.txt || status=$?
++          cat artifacts/native-inputs.txt
++          echo "Input check exit status: ${status:-0}"
++      - name: Build and package app
++        if: ${{ inputs.build_app }}
++        run: bash build/ci/build-unsigned-ipa.sh
++      - uses: actions/upload-artifact@v4
++        if: always()
++        with:
++          name: madeira-ios18-results
++          path: artifacts/
++          if-no-files-found: warn
+diff --git a/app/Madeira/ContentView.swift b/app/Madeira/ContentView.swift
+index b04a349..72b1d8d 100644
+--- a/app/Madeira/ContentView.swift
++++ b/app/Madeira/ContentView.swift
+@@ -2625,12 +2625,12 @@ struct ContentView: View {
+             }
+ 
+             winios_phase("pool-alloc-begin")
+-            logStore.log("Allocating \(poolSizeMB)MB JIT pool (BRK will suspend process)...")
++            logStore.log("Allocating \(poolSizeMB)MB JIT pool...")
+             let t0 = CFAbsoluteTimeGetCurrent()
+             let pool = StikJITHelper.allocatePool(poolSize: poolSizeMB * 1024 * 1024)
+             let elapsed = CFAbsoluteTimeGetCurrent() - t0
+             winios_phase("pool-ready")
+-            logStore.log("BRK suspension lasted \(String(format: "%.2f", elapsed))s")
++            logStore.log("JIT allocation took \(String(format: "%.2f", elapsed))s")
+ 
+             // Arena carver self-test. Documents/madeira-arena-test.txt holds
+             // "churn:N", "ramp:N" or "random:N". Deliberately a SEPARATE file
+diff --git a/app/Madeira/FEXBridge.mm b/app/Madeira/FEXBridge.mm
+index 63192b5..b2e4f89 100644
+--- a/app/Madeira/FEXBridge.mm
++++ b/app/Madeira/FEXBridge.mm
+@@ -142,6 +142,7 @@ static bool jit_pool_init(void) {
+     );
+     if (kr != KERN_SUCCESS) {
+         fex_log("FAIL: vm_remap for RW mirror: %s (kr=%d)", mach_error_string(kr), kr);
++        vm_deallocate(task, (vm_address_t)rx_ptr, size);
+         return false;
+     }
+ 
+@@ -150,6 +151,7 @@ static bool jit_pool_init(void) {
+     if (kr != KERN_SUCCESS) {
+         fex_log("FAIL: vm_protect(RW): %s (kr=%d)", mach_error_string(kr), kr);
+         vm_deallocate(task, rw_addr, size);
++        vm_deallocate(task, (vm_address_t)rx_ptr, size);
+         return false;
+     }
+ 
+diff --git a/app/Madeira/JITAllocator.c b/app/Madeira/JITAllocator.c
+index 9982540..58957ce 100644
+--- a/app/Madeira/JITAllocator.c
++++ b/app/Madeira/JITAllocator.c
+@@ -6,6 +6,7 @@
+ #include <stdlib.h>
+ #include <string.h>
+ #include <stdio.h>
++#include <stdarg.h>
+ #include <libkern/OSCacheControl.h>
+ #include <pthread.h>
+ #include <unistd.h>
+@@ -368,6 +369,13 @@ void *jit_region_write(JITRegion *region, size_t offset, const void *code, size_
+     return (char *)region->rx_ptr + offset;
+ }
+ 
++#include "JITLegacy.h"
++
++bool jit_uses_debugger_protocol(void) {
++    if (__builtin_available(iOS 26.0, *)) return true;
++    return false;
++}
++
+ // SIGTRAP handler: skips BRK instruction (PC += 4) and zeros x0.
+ // This prevents crashes when BRK is executed without a debugger attached.
+ static void sigtrap_handler(int sig, siginfo_t *info, void *context) {
+@@ -379,6 +387,8 @@ static void sigtrap_handler(int sig, siginfo_t *info, void *context) {
+ }
+ 
+ void jit_install_trap_handler(void) {
++    // Legacy JIT uses no BRK commands. Preserve normal crash handling there.
++    if (!jit_uses_debugger_protocol()) return;
+     // Only install if no debugger is attached.
+     // When StikDebug is attached, it handles BRK/SIGTRAP directly.
+     // Our handler would steal signals from the debugger and break the protocol.
+@@ -395,6 +405,7 @@ void jit_install_trap_handler(void) {
+ }
+ 
+ void jit_arm_trap_fallback(void) {
++    if (!jit_uses_debugger_protocol()) return;
+     struct sigaction sa;
+     memset(&sa, 0, sizeof(sa));
+     sa.sa_flags = SA_SIGINFO;
+@@ -432,6 +443,11 @@ uint64_t jit_available_memory(void) {
+ 
+ __attribute__((noinline, optnone))
+ void *jit26_prepare_region(void *addr, size_t len) {
++    // Retain the exported name for existing bridge callers, but dispatch by OS.
++    // CS_DEBUGGED is sticky after detach; on iOS 18 that is sufficient for the
++    // legacy backend, but it does NOT mean a BRK-serving debugger is attached.
++    if (!jit_check_debugged()) return NULL;
++    if (!jit_uses_debugger_protocol()) return jit_legacy_prepare_region(addr, len);
+     register void *x0 __asm__("x0") = addr;
+     register size_t x1 __asm__("x1") = len;
+     __asm__ volatile(
+@@ -446,6 +462,9 @@ void *jit26_prepare_region(void *addr, size_t len) {
+ 
+ __attribute__((noinline, optnone))
+ void jit26_detach(void) {
++    // StikDebug's legacy enable flow already detaches. Issuing BRK here would
++    // cause a second SIGTRAP even after fixing pool allocation.
++    if (!jit_uses_debugger_protocol() || !jit_check_debugged()) return;
+     __asm__ volatile(
+         "mov x16, #0\n"
+         "brk #0xf00d\n"
+@@ -589,6 +608,10 @@ int64_t jit_test_execute(void) {
+                 region->rx_ptr, region->size);
+         void *prepared = jit26_prepare_region(region->rx_ptr, region->size);
+         jit_log("prepare_region returned: %p", prepared);
++        if (!prepared) {
++            jit_region_destroy(region);
++            return -1;
++        }
+ 
+         jit_check_page_protection(region->rx_ptr, "RX page AFTER prepare");
+ 
+diff --git a/app/Madeira/JITAllocator.h b/app/Madeira/JITAllocator.h
+index 700e2c7..6c99fff 100644
+--- a/app/Madeira/JITAllocator.h
++++ b/app/Madeira/JITAllocator.h
+@@ -71,12 +71,16 @@ bool jit_task_map_range(uint64_t *min_address, uint64_t *max_address);
+ // Memory this process may still allocate before the system's limit.
+ uint64_t jit_available_memory(void);
+ 
+-// iOS 26 BRK-based protocol: Ask attached debugger (StikDebug) to
+-// prepare a memory region for JIT execution.
++// Whether this OS uses the existing iOS 26 debugger-script backend.
++// This is a backend selector, NOT proof that a debugger is currently attached.
++bool jit_uses_debugger_protocol(void);
++
++// Compatibility entry point: pre-iOS-26 uses local Mach VM preparation after
++// CS_DEBUGGED; iOS 26+ asks the attached StikDebug script via BRK.
+ // Returns the prepared address (may differ from input on allocation).
+ void *jit26_prepare_region(void *addr, size_t len);
+ 
+-// iOS 26 BRK-based protocol: Tell the debugger to detach.
++// iOS 26+: tell the debugger to detach. No-op on the legacy backend.
+ void jit26_detach(void);
+ 
+ // Test if dual-mapped regions can be created and RX pages are viable,
+diff --git a/app/Madeira/JITLegacy.h b/app/Madeira/JITLegacy.h
+new file mode 100644
+index 0000000..e96fa94
+--- /dev/null
++++ b/app/Madeira/JITLegacy.h
+@@ -0,0 +1,65 @@
++#ifndef MADEIRA_JIT_LEGACY_H
++#define MADEIRA_JIT_LEGACY_H
++
++/* Included by JITAllocator.c after the Mach declarations and jit_log.
++ * Kept independent of UIKit so the allocation/rollback contract can be tested
++ * with a fake Mach VM on a host. This is the pre-TXM (iOS <26) backend.
++ * The caller must check CS_DEBUGGED; no breakpoint or MAP_JIT is needed here.
++ */
++static void *jit_legacy_prepare_region(void *addr, size_t len) {
++    const size_t mask = JIT_PAGE_SIZE - 1;
++    if (!len || len > SIZE_MAX - mask || ((uintptr_t)addr & mask)) {
++        jit_log("Legacy JIT: invalid address/length");
++        return NULL;
++    }
++    size_t size = (len + mask) & ~mask;
++    if (addr && (uintptr_t)addr > UINTPTR_MAX - size) return NULL;
++    vm_address_t base = (vm_address_t)addr;
++    bool owned = addr == NULL;
++    kern_return_t kr;
++    if (owned) {
++        kr = vm_allocate(mach_task_self(), &base, size, VM_FLAGS_ANYWHERE);
++        if (kr != KERN_SUCCESS) {
++            jit_log("Legacy JIT: vm_allocate failed (%d)", kr);
++            return NULL;
++        }
++        /* Establish executable, writable backing before making the canonical
++         * view RX. vm_remap(copy=FALSE) can then create the existing RW alias.
++         * Never request a new maximum protection to elevate a restricted map.
++         */
++        kr = vm_protect(mach_task_self(), base, size, FALSE, VM_PROT_ALL);
++        if (kr != KERN_SUCCESS) goto failed;
++    }
++    kr = vm_protect(mach_task_self(), base, size, FALSE,
++                    VM_PROT_READ | VM_PROT_EXECUTE);
++    if (kr != KERN_SUCCESS) goto failed;
++
++    /* A successful protection call alone is insufficient: check the effective
++     * permissions and the maximum needed by the later writable remap.
++     */
++    vm_address_t query = base;
++    vm_size_t span = 0;
++    vm_region_basic_info_data_64_t info = {0};
++    mach_msg_type_number_t count = VM_REGION_BASIC_INFO_COUNT_64;
++    mach_port_t object = MACH_PORT_NULL;
++    kr = vm_region_64(mach_task_self(), &query, &span, VM_REGION_BASIC_INFO_64,
++                      (vm_region_info_t)&info, &count, &object);
++    if (object != MACH_PORT_NULL) mach_port_deallocate(mach_task_self(), object);
++    if (kr != KERN_SUCCESS || query > base || base - query > span ||
++        size > span - (base - query) ||
++        (info.protection & (VM_PROT_READ | VM_PROT_EXECUTE)) !=
++            (VM_PROT_READ | VM_PROT_EXECUTE) ||
++        (owned && (info.max_protection & VM_PROT_ALL) != VM_PROT_ALL)) {
++        jit_log("Legacy JIT: unusable mapping (kr=%d, prot=%d, max=%d)",
++                kr, info.protection, info.max_protection);
++        goto failed;
++    }
++    sys_icache_invalidate((void *)base, size);
++    return (void *)base;
++
++failed:
++    jit_log("Legacy JIT: preparation failed (%d); enable JIT and retry", kr);
++    if (owned) vm_deallocate(mach_task_self(), base, size);
++    return NULL;
++}
++#endif
+diff --git a/app/Madeira/StikJITHelper.swift b/app/Madeira/StikJITHelper.swift
+index c034072..efca097 100644
+--- a/app/Madeira/StikJITHelper.swift
++++ b/app/Madeira/StikJITHelper.swift
+@@ -32,11 +32,14 @@ enum StikJITHelper {
+     static func enableJIT(completion: @escaping (Bool) -> Void) {
+         let bundleId = Bundle.main.bundleIdentifier ?? "com.madeira.emulator"
+ 
+-        // Build the URL with script data
+-        let scriptData = resolvedScriptBase64.addingPercentEncoding(withAllowedCharacters: .urlQueryAllowed) ?? ""
+-        let urlString = "stikjit://enable-jit?bundle-id=\(bundleId)&script-data=\(scriptData)"
+-
+-        guard let url = URL(string: urlString) else {
++        // iOS 18 uses StikDebug's ordinary enable-and-detach flow. Its script
++        // runner is not used there, so do not imply that BRK will be serviced.
++        var components = URLComponents(string: "stikjit://enable-jit")!
++        components.queryItems = [URLQueryItem(name: "bundle-id", value: bundleId)]
++        if jit_uses_debugger_protocol() {
++            components.queryItems?.append(URLQueryItem(name: "script-data", value: resolvedScriptBase64))
++        }
++        guard let url = components.url else {
+             LogStore.shared.log("Failed to build StikJIT URL", level: .error)
+             completion(false)
+             return
+@@ -97,19 +100,26 @@ enum StikJITHelper {
+     /// is the state StikDebug's own app list (attach, then detach) leaves behind.
+     static var ready: Bool {
+         guard jit_check_debugged() else { return false }
+-        return !attachCheck || poolTaken || isDebuggerAttached()
++        return !jit_uses_debugger_protocol() || !attachCheck || poolTaken || isDebuggerAttached()
+     }
+ 
+     /// CS_DEBUGGED is set but nothing can answer a pool request: JIT has to be
+     /// enabled again, through Madeira, before a game can start.
+     static var flaggedWithoutDebugger: Bool { jit_check_debugged() && !ready }
+ 
+-    /// Allocate a JIT memory pool via BRK #0xf00d WITHOUT detaching the debugger.
+-    /// The debugger stays attached so Wine can use BRK to prepare PE code pages.
++    /// Allocate through the OS-selected backend, preserving common placement
++    /// constraints and the RX/RW alias layout expected by Wine and FEX.
+     static func allocatePool(poolSize requestedPoolSize: Int = 128 * 1024 * 1024) -> (rx: UnsafeMutableRawPointer, rw: UnsafeMutableRawPointer, size: Int)? {
+-        var poolSize = requestedPoolSize      // ml1036: may shrink to fit, see the hole census below
+         poolFailure = nil
+-        LogStore.shared.log("Allocating \(poolSize / 1024 / 1024)MB JIT pool via debugger...")
++        guard requestedPoolSize > 0, requestedPoolSize <= Int.max - 0x3fff,
++              jit_check_debugged() else {
++            poolFailure = "Enable JIT first and use a positive pool size."
++            LogStore.shared.log("JIT pool unavailable: enable JIT first and use a positive pool size", level: .error)
++            return nil
++        }
++        var poolSize = (requestedPoolSize + 0x3fff) & ~0x3fff
++        let backend = jit_uses_debugger_protocol() ? "debugger script" : "legacy Mach VM"
++        LogStore.shared.log("Allocating \(poolSize / 1024 / 1024)MB JIT pool via \(backend)...")
+ 
+         let debuggerAttached = isDebuggerAttached()
+         LogStore.shared.log("[jit-debugger] attached=\(debuggerAttached ? 1 : 0) at the pool request")
+@@ -121,7 +131,7 @@ enum StikJITHelper {
+         // whether a debugger is attached now. The handler cannot take a BRK away
+         // from an attached debugger, which sees the exception first, so a wrong
+         // reading costs nothing.
+-        if !debuggerAttached && MadeiraConfig.flag("MADEIRA_JIT_TRAP_FALLBACK") {
++        if jit_uses_debugger_protocol() && !debuggerAttached && MadeiraConfig.flag("MADEIRA_JIT_TRAP_FALLBACK") {
+             jit_arm_trap_fallback()
+             LogStore.shared.log("[jit-debugger] no debugger is attached although CS_DEBUGGED is set: "
+                 + "an unanswered pool request now fails the launch instead of crashing the app", level: .error)
+@@ -394,6 +404,7 @@ enum StikJITHelper {
+             guard let p = jit26_prepare_region(nil, poolSize), p != UnsafeMutableRawPointer(bitPattern: 0) else {
+                 LogStore.shared.log("Debugger failed to allocate RX memory (attempt \(attempt))", level: .error)
+                 requestUnanswered = true
++                LogStore.shared.log("\(backend) failed to allocate RX memory (attempt \(attempt))", level: .error)
+                 break
+             }
+             let a = Int(bitPattern: p)
+@@ -419,6 +430,11 @@ enum StikJITHelper {
+         // ml1040: the plugs existed only to steer first-fit; give the VA back.
+         for (a, sz) in plugs { vm_deallocate(mach_task_self_, a, sz) }
+         guard let rxPtr = rxPtrOpt else {
++            if !jit_uses_debugger_protocol() {
++                poolFailure = "Legacy JIT memory setup failed. Enable JIT and retry; if it persists, send the diagnostic log."
++                LogStore.shared.log("Legacy JIT pool unavailable. Check JIT activation and available address space.", level: .error)
++                return nil
++            }
+             if requestUnanswered && !debuggerAttached {
+                 // Nothing answered the BRK: there is no pool and no placement to
+                 // re-roll, so the app stays up and says what to do.
+@@ -600,6 +616,7 @@ enum StikJITHelper {
+             LogStore.shared.log("vm_remap failed: \(kr1)", level: .error)
+             poolFailure = "Madeira could not map its JIT memory (vm_remap error \(kr1)). Restart Madeira and try again; "
+                 + "if it keeps happening, send the diagnostic log."
++            vm_deallocate(mach_task_self_, vm_address_t(bitPattern: rxPtr), vm_size_t(poolSize))
+             return nil
+         }
+ 
+@@ -619,6 +636,7 @@ enum StikJITHelper {
+             vm_deallocate(mach_task_self_, rwAddr, vm_size_t(poolSize))
+             poolFailure = "Madeira could not make its JIT memory writable (vm_protect error \(kr2)). Restart Madeira and try again; "
+                 + "if it keeps happening, send the diagnostic log."
++            vm_deallocate(mach_task_self_, vm_address_t(bitPattern: rxPtr), vm_size_t(poolSize))
+             return nil
+         }
+ 
+@@ -643,14 +661,19 @@ enum StikJITHelper {
+         // the UI view. Detail (kr / footprint delta) is in the jit_log lines.
+         LogStore.shared.log("[no-footprint] pool applied=\(exempt)", level: exempt ? .success : .error)
+ 
+-        LogStore.shared.log("JIT pool ready (debugger still attached).", level: .success)
+         poolTaken = true
++        LogStore.shared.log("JIT pool ready (\(backend)).", level: .success)
+ 
+         return (rx: rxPtr, rw: rwPtr, size: poolSize)
+     }
+ 
+     /// Detach the debugger. Call this after Wine is done loading PE DLLs.
+     static func detachDebugger() {
++        if !jit_uses_debugger_protocol() {
++            setenv("MADEIRA_DETACHED", "1", 1)
++            LogStore.shared.log("Legacy JIT: no debugger-script detach required.")
++            return
++        }
+         LogStore.shared.log("Detaching debugger...")
+         jit26_detach()
+         // task #34: signal in-process waiters (share-probe poller). CS_DEBUGGED
+diff --git a/build/ci/bootstrap-native.sh b/build/ci/bootstrap-native.sh
+new file mode 100644
+index 0000000..96dbdcb
+--- /dev/null
++++ b/build/ci/bootstrap-native.sh
+@@ -0,0 +1,25 @@
++#!/bin/bash
++set -euo pipefail
++export ROOT="$(cd "$(dirname "$0")/../.." && pwd)"
++export JOBS="$(sysctl -n hw.ncpu)"
++cd "$ROOT"
++brew install cmake ninja meson pkg-config autoconf automake libtool bison flex llvm
++export PATH="$(brew --prefix bison)/bin:$(brew --prefix llvm)/bin:$PATH"
++git submodule update --init --recursive --depth 1
++bash scripts/build/setup-llvm-mingw.sh
++bash scripts/build/build-wine.sh
++bash scripts/build/build-fex-ios.sh
++bash scripts/build/build-freetype-ios.sh
++bash build/gnutls-ios/build.sh
++bash scripts/build/sync-gnutls-libs.sh
++bash build/ffmpeg/build.sh
++bash build/wineserver/bootstrap.sh
++bash build/wineserver/build.sh
++bash build/ntdll-unix/build.sh
++bash build/win32u-unix/build.sh
++bash scripts/build/build-llvm-ios.sh
++xcodebuild -downloadComponent MetalToolchain
++bash scripts/build/build-shader-headers.sh
++bash scripts/build/build-dxmt-ios.sh
++# Microsoft runtime DLLs are intentionally omitted, as in upstream releases.
++mkdir -p app/Madeira/x86_64-vcruntime
+diff --git a/build/ci/build-unsigned-ipa.sh b/build/ci/build-unsigned-ipa.sh
+new file mode 100644
+index 0000000..d561bcd
+--- /dev/null
++++ b/build/ci/build-unsigned-ipa.sh
+@@ -0,0 +1,40 @@
++#!/bin/bash
++# App packaging stage only; requires the native dependencies from BUILDING.md.
++set -euo pipefail
++ROOT="$(cd "$(dirname "$0")/../.." && pwd)"
++cd "$ROOT"
++python3 build/ci/check-app-inputs.py
++[[ "$(uname -s)" == Darwin ]] || { echo 'Xcode on macOS is required.' >&2; exit 2; }
++mkdir -p artifacts
++bash build/stage-licenses.sh
++xcodebuild -project app/Madeira.xcodeproj -scheme Madeira \
++    -configuration Debug -sdk iphoneos -destination 'generic/platform=iOS' \
++    -derivedDataPath "$ROOT/.ci-derived" \
++    CODE_SIGNING_ALLOWED=NO CODE_SIGNING_REQUIRED=NO CODE_SIGN_IDENTITY= \
++    DEVELOPMENT_TEAM= IPHONEOS_DEPLOYMENT_TARGET=18.5 build \
++    2>&1 | tee artifacts/xcodebuild.log
++APP="$ROOT/.ci-derived/Build/Products/Debug-iphoneos/Madeira.app"
++[[ -f "$APP/Madeira" && -f "$APP/Info.plist" ]] || exit 3
++# Use a fresh staging directory so an earlier failed build cannot leak files.
++STAGE="$(mktemp -d "$ROOT/artifacts/package.XXXXXX")"
++trap 'rm -rf "$STAGE"' EXIT
++mkdir "$STAGE/Payload"
++ditto "$APP" "$STAGE/Payload/Madeira.app"
++# The upstream copy phase ad-hoc signs the converter even with signing disabled.
++# Remove those signatures in the output copy; the sideloader signs the bundle.
++while IFS= read -r -d '' binary; do
++    if codesign -d "$binary" >/dev/null 2>&1; then
++        codesign --remove-signature "$binary"
++    fi
++done < <(find "$STAGE/Payload/Madeira.app" -type f \( -name '*.dylib' -o -name Madeira \) -print0)
++find "$STAGE/Payload" -name _CodeSignature -type d -prune -exec rm -rf {} +
++find "$STAGE/Payload" -name embedded.mobileprovision -type f -delete
++OUTPUT="$ROOT/artifacts/Madeira-iOS18-experimental-unsigned.ipa"
++# zip updates existing archives: remove the old output first to avoid stale entries.
++rm -f "$OUTPUT"
++(cd "$STAGE" && zip -qry "$OUTPUT" Payload)
++unzip -t "$OUTPUT"
++shasum -a 256 "$OUTPUT" > "$OUTPUT.sha256"
++git rev-parse HEAD > artifacts/source-revision.txt
++git diff --binary HEAD > artifacts/local-changes.patch
++echo "Packaged unsigned IPA: $OUTPUT (device validation still required)"
+diff --git a/build/ci/check-app-inputs.py b/build/ci/check-app-inputs.py
+new file mode 100644
+index 0000000..5215913
+--- /dev/null
++++ b/build/ci/check-app-inputs.py
+@@ -0,0 +1,25 @@
++#!/usr/bin/env python3
++"""Report missing Xcode link inputs before claiming an IPA build is possible."""
++import re
++import sys
++from pathlib import Path
++
++root = Path(__file__).resolve().parents[2]
++project = (root / "app/Madeira.xcodeproj/project.pbxproj").read_text()
++missing = []
++for line in project.splitlines():
++    if "isa = PBXFileReference" not in line or "archive.ar" not in line:
++        continue
++    match = re.search(r'\bpath = (?:"([^"]+)"|([^;]+));', line)
++    if not match:
++        raise RuntimeError(f"Cannot parse library reference: {line}")
++    path = root / "app/Madeira" / (match[1] or match[2])
++    if not path.is_file():
++        missing.append(str(path.resolve().relative_to(root)))
++for item in missing:
++    print(f"MISSING: {item}")
++if missing:
++    print(f"\n{len(missing)} native archives missing. See docs/BUILDING.md and docs/IOS18-JIT.md.")
++    print("This check does not bootstrap dependencies or validate their architecture/source revision.")
++    sys.exit(2)
++print("All Xcode static-library file references exist; compilation/link validation is still required.")
+diff --git a/build/ntdll-unix/server_ios.c b/build/ntdll-unix/server_ios.c
+index 58fddba..565f37f 100644
+--- a/build/ntdll-unix/server_ios.c
++++ b/build/ntdll-unix/server_ios.c
+@@ -1487,6 +1487,10 @@ static void ios_xp_api_report( const char *wall, double wall_s )
+ 
+ static void ios_xprobe_main( void )
+ {
++#if __IPHONE_OS_VERSION_MAX_ALLOWED < 270000
++    /* Optional profiler uses rusage fields added to the iOS 27 SDK. */
++    wine_log_write( "[xp] extended profiler unavailable with this SDK" );
++#else
+     static struct ios_xp_row rows[1024];
+     mach_timebase_info_data_t tb;
+     struct rusage_info_v6 ru, pru;
+@@ -1630,6 +1634,7 @@ static void ios_xprobe_main( void )
+         t_prev = now;
+ #undef XP_MS
+     }
++#endif
+ }
+ 
+ /* ml1129: WORKER PROFILER (measurement only). The submission worker (role W)
+diff --git a/build/ntdll-unix/signal_arm64_ios.c b/build/ntdll-unix/signal_arm64_ios.c
+index c12eba5..cd0be16 100644
+--- a/build/ntdll-unix/signal_arm64_ios.c
++++ b/build/ntdll-unix/signal_arm64_ios.c
+@@ -13216,7 +13216,11 @@ void init_syscall_frame( LPTHREAD_START_ROUTINE entry, void *arg, BOOL suspend,
+         /* M8: Ask the debugger to write TEB data to page 0 via BRK #0xf00d cmd 3.
+          * The debugger may have kernel privileges that the app doesn't.
+          * Uses GDB M (memory write) command to write TEB data at address 0. */
+-        if (!mapped) {
++        /* iOS 18's JIT enabler does not service BRK requests. Skip this optional
++         * debugger fallback there and retain the existing Mach-handler path. */
++        int use_debugger_script = 0;
++        if (__builtin_available(iOS 26.0, *)) use_debugger_script = 1;
++        if (!mapped && use_debugger_script) {
+             ERR("page0: trying debugger (BRK #0xf00d, x16=3)...\n");
+             register uintptr_t x0_val __asm__("x0") = (uintptr_t)teb;
+             register size_t x1_val __asm__("x1") = 0x4000;
+diff --git a/build/wineserver/bootstrap.sh b/build/wineserver/bootstrap.sh
+new file mode 100755
+index 0000000..4849e65
+--- /dev/null
++++ b/build/wineserver/bootstrap.sh
+@@ -0,0 +1,74 @@
++#!/usr/bin/env bash
++# Build the pristine iOS wineserver archive that build.sh patches in-place.
++# This removes the circular requirement that contributors already have an
++# untracked app/Madeira/libwineserver.a before their first build.
++set -euo pipefail
++
++BUILD_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
++REPO_ROOT="$(cd "$BUILD_DIR/../.." && pwd)"
++WINE_SRC="$REPO_ROOT/wine"
++SDK="$(xcrun --sdk iphoneos --show-sdk-path)"
++OBJ_DIR="$BUILD_DIR/obj"
++BASE_DIR="$OBJ_DIR/base"
++APP_LIB="$REPO_ROOT/app/Madeira/libwineserver.a"
++SHIMS_DIR="$REPO_ROOT/build/ntdll-unix/shims"
++
++if [[ -f "$OBJ_DIR/libwineserver.a" || -f "$APP_LIB" ]]; then
++  echo "wineserver base: cached"
++  exit 0
++fi
++
++[[ -f "$WINE_SRC/build-macos/include/config.h" ]] || {
++  echo "ERROR: Wine host tree is missing; run scripts/build/build-wine.sh first" >&2
++  exit 1
++}
++
++mkdir -p "$BASE_DIR"
++CC_FLAGS=(
++  -arch arm64 -isysroot "$SDK" -miphoneos-version-min=17.0 -O2
++  -I"$WINE_SRC/include" -I"$WINE_SRC/include/wine"
++  -I"$WINE_SRC/build-macos/include" -I"$WINE_SRC/build-macos/server"
++  -I"$BUILD_DIR" -I"$WINE_SRC/server"
++  -I"$SHIMS_DIR"
++  -include "$BUILD_DIR/config_ios.h"
++  -include stdarg.h
++  -include "$BUILD_DIR/unicode_fix.h"
++  -include "$BUILD_DIR/wineserver_ios_kill.h"
++  -DBINDIR=\"/usr/local/bin\" -DDATADIR=\"/usr/local/share\"
++  -D__WINESRC__ -DWINE_IOS=1
++  -Dmain=wineserver_main
++  -Wno-implicit-function-declaration
++)
++
++# build.sh replaces these with Madeira's iOS-specific/patched variants. They do
++# not need to be present in the pristine archive.
++is_replaced() {
++  case "$1" in
++    async.c|class.c|fd.c|mach.c|main.c|mapping.c|object.c|process.c|queue.c|region.c|request.c|sock.c|thread.c|unicode.c|user.c|window.c|winstation.c)
++      return 0 ;;
++    *) return 1 ;;
++  esac
++}
++
++objects=()
++while IFS= read -r base; do
++  [[ -n "$base" ]] || continue
++  is_replaced "$base" && continue
++  src="$WINE_SRC/server/$base"
++  obj="$BASE_DIR/${base%.c}.o"
++  echo "  bootstrap ${base%.c}"
++  xcrun -sdk iphoneos clang "${CC_FLAGS[@]}" -c "$src" -o "$obj"
++  objects+=("$obj")
++done < <(awk '
++  /^SOURCES =/ { in_sources=1; next }
++  in_sources && /^UNIX_CFLAGS/ { exit }
++  in_sources {
++    gsub(/\\/, "")
++    for (i=1; i<=NF; i++) if ($i ~ /\.c$/) print $i
++  }
++' "$WINE_SRC/server/Makefile.in")
++
++(( ${#objects[@]} > 0 )) || { echo "ERROR: no wineserver sources were compiled" >&2; exit 1; }
++ar rcs "$OBJ_DIR/libwineserver.a" "${objects[@]}"
++cp "$OBJ_DIR/libwineserver.a" "$APP_LIB"
++echo "wineserver base: $(wc -c < "$APP_LIB" | tr -d ' ') bytes"
+diff --git a/build/wineserver/build.sh b/build/wineserver/build.sh
+index 2c55a25..611ae5d 100755
+--- a/build/wineserver/build.sh
++++ b/build/wineserver/build.sh
+@@ -199,8 +199,8 @@ echo "=== Renaming colliding symbols in every .o (objcopy sweep) ==="
+ # we know collide with win32u-unix, repackage. Affects definitions AND
+ # references uniformly, so cross-file calls inside wineserver still
+ # resolve. Externals (win32u, etc.) only see the ws_-prefixed names.
+-OBJCOPY=$(command -v llvm-objcopy || echo /opt/homebrew/opt/llvm/bin/llvm-objcopy)
+-[ -x "$OBJCOPY" ] || OBJCOPY=/opt/homebrew/Cellar/llvm/22.1.0/bin/llvm-objcopy
++OBJCOPY=$(command -v llvm-objcopy || echo "$(brew --prefix llvm)/bin/llvm-objcopy")
++[ -x "$OBJCOPY" ] || { echo "llvm-objcopy unavailable" >&2; exit 1; }
+ COLLISIONS=(
+     alloc_user_handle free_user_handle get_virtual_screen_rect
+     destroy_thread_windows get_window_thread is_desktop_class
+diff --git a/docs/IOS18-JIT.md b/docs/IOS18-JIT.md
+new file mode 100644
+index 0000000..0f132fe
+--- /dev/null
++++ b/docs/IOS18-JIT.md
+@@ -0,0 +1,115 @@
++# Experimental iOS 18 JIT compatibility work
++
++Base: `ca3183ea3dfb0fd706aff1bea2abb871b5d27aec` (willfaust/Madeira v0.1.1).
++
++## Status
++
++Candidate patch, **not a validated iOS 18 port**. The host allocator tests pass.
++No macOS runner has been dispatched and no IPA has been produced at this stage.
++The local execution host is Linux, without Xcode. GitHub browser authentication
++is required to create a fork and dispatch the prepared workflow.
++
++## Crash investigation
++
++The reported iPhone 13 / iOS 18.5 failure is SIGTRAP, BRK immediate 61453
++(`0xf00d`), in `jit26_prepare_region` called from `StikJITHelper.allocatePool`.
++That function unconditionally issued Madeira's debugger RPC instruction.
++StikDebug's `ProcessInfo.hasTXM` returns false before iOS 26, and its HomeView
++only enters the script path when hasTXM is true. A normal legacy JIT enable
++therefore does not establish the BRK-serving script Madeira expects.
++`CS_DEBUGGED` persists after detach and cannot establish that the script is
++listening. This explains the reported breakpoint, but does not establish that
++Wine/FEX will otherwise work on this phone. The original full crash file was
++not available in this workspace; the reported stack and trap immediate were
++recovered from the preceding conversation.
++
++## Changes
++
++* Preserve the existing `jit26_prepare_region` symbol, dispatching pre-iOS-26
++  calls to a legacy Mach VM backend after checking `CS_DEBUGGED`.
++* Allocate writable/executable backing, transition the canonical view to RX,
++  verify effective and maximum permissions, then retain the existing shared
++  RW-alias creation and Wine/FEX placement constraints. No MAP_JIT entitlement
++  or blanket signal-handler workaround is introduced for iOS 18.
++* Reject zero, overflowing and unaligned requests. Release newly owned memory
++  and Mach object ports on failures. Do not free caller-owned existing regions.
++* Skip script URL data, BRK detach and trap-handler installation on iOS 18.
++  Skip Wine's optional page-zero BRK fallback on iOS 18 as well.
++* Stop the execution diagnostic if preparation fails. Clean up the RX allocation
++  if creating/protecting its RW alias fails in the Swift and FEX pool paths.
++
++The iOS-26-and-later backend is otherwise retained; this patch does not solve
++its script-readiness detection or non-TXM hardware selection. No app-wide iOS 18
++compatibility claim follows from this change.
++
++## Verification performed
++
++```
++cc -std=c11 -Wall -Wextra -Werror tests/host/jit-legacy-test.c -o /tmp/jit-test
++/tmp/jit-test
++git diff --check
++bash -n build/ci/build-unsigned-ipa.sh
++python3 build/ci/check-app-inputs.py
++```
++
++The C test executes the production legacy helper with mocked Mach operations.
++It covers allocation, page rounding, coalesced VM regions, invalid inputs,
++allocation/protection/query failure, silently missing execute permission,
++insufficient maximum protection, port cleanup and caller-owned mappings.
++It cannot validate the real iOS kernel's JIT policy, alias coherence, cache
++maintenance or execution. The input check correctly exits 2 for missing inputs.
++
++## Build blockers and prepared workflow
++
++`.github/workflows/ios18-jit.yml` runs on `macos-15`. Its default validation mode
++compiles the allocator against the iPhone SDK, parses the changed Swift files,
++runs the host test and uploads an input report. **It is not a complete native
++dependency bootstrap.** Swift parsing is not type-checking or an app build.
++
++The optional app-packaging stage uses Debug (as required by upstream), disables
++signing and produces a Payload ZIP only after xcodebuild succeeds. A fresh
++checkout cannot currently reach that stage: 15 referenced archives are absent,
++including the FEX libraries, Wine unix/server libraries, DXMT and FFmpeg.
++
++Upstream `docs/BUILDING.md` is the starting recipe, but inspection also found:
++
++* `build/wineserver/build.sh` requires an existing base `libwineserver.a`.
++* `build/dxmt-ios/build.sh` refreshes an existing combined archive; when absent,
++  it prints a note rather than creating the combined LLVM/DXMT library.
++* Wine scripts require generated `wine/build-macos` headers/configuration.
++* The LLVM iOS build and FreeType inputs also need provisioning.
++
++After GitHub access is available, first run SDK validation, fix any compilation
++errors, then complete the native bootstrap (or obtain matching reproducible
++build inputs). Merely enabling `build_app` on the current workflow will report
++missing dependencies; it cannot produce a usable emulator from this checkout.
++
++## Required device validation
++
++1. Sideload the successfully built IPA with development/get-task-allow signing.
++2. Start a fresh process with JIT disabled: allocation must fail without SIGTRAP.
++3. Enable ordinary StikDebug JIT on iOS 18.5, then allocate the pool. Confirm the
++   log selects `legacy Mach VM`, valid RX placement, and successful RW alias.
++4. Verify alias coherence and execute the existing JIT test (expected 42).
++5. Start Wine, then a small guest program; exercise session exit and relaunch.
++6. Check iOS 26 with the Madeira script for regression separately.
++
++Packaging and sideloading do not themselves enable JIT. Real-device failures
++after pool allocation may require further Wine/FEX, graphics or memory changes.
++
++## Rebased onto v0.1.1
++
++The October 2 release adds debugger-presence checks and a kernel-placement retry
++for the RW alias on 63 GB maps. Both are retained. On the legacy backend, JIT
++readiness accepts CS_DEBUGGED without a live debugger, the trap fallback stays
++disabled, and allocation failures use the new user-visible poolFailure field.
++The official release still requires iOS 26; it is not an iOS 18 compatibility fix.
++
++## Build bootstrap continuation
++
++Authenticated access revealed an existing successful build in shkoios/Madeira.
++Imported its native bootstrap scripts (source ref recorded in git history),
++adapted the DXMT path and FEX patch to v0.1.1, and disabled only the optional
++rusage profiler when compiling against an SDK older than 27. The hosted build
++uses a clean pinned v0.1.1 checkout plus the combined patch. This bootstrap is
++pending runner verification; the earlier missing-input report is historical.
+diff --git a/scripts/build/build-dxmt-ios.sh b/scripts/build/build-dxmt-ios.sh
+new file mode 100755
+index 0000000..4b46bd3
+--- /dev/null
++++ b/scripts/build/build-dxmt-ios.sh
+@@ -0,0 +1,25 @@
++#!/usr/bin/env bash
++set -euo pipefail
++ROOT="${ROOT:-$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)}"
++BUILD="$ROOT/build/dxmt-ios"
++OUT="$ROOT/app/Madeira/libdxmt_combined.a"
++
++if [[ -f "$OUT" ]]; then
++  echo "DXMT iOS: cached"
++  exit 0
++fi
++
++# Xcode installs the Metal compiler separately on recent releases. It is safe to
++# call this repeatedly; xcodebuild returns immediately when already installed.
++xcodebuild -downloadComponent MetalToolchain >/dev/null 2>&1 || true
++
++"$BUILD/build.sh"
++
++shopt -s nullglob
++objs=("$BUILD"/obj/*.o)
++llvm_libs=("$ROOT"/toolchains/llvm-ios-build/lib/*.a)
++(( ${#objs[@]} > 0 )) || { echo "ERROR: DXMT produced no object files" >&2; exit 1; }
++(( ${#llvm_libs[@]} > 0 )) || { echo "ERROR: LLVM iOS static libraries are missing" >&2; exit 1; }
++
++xcrun -sdk iphoneos libtool -static -o "$BUILD/libdxmt_combined.a" "${objs[@]}" "${llvm_libs[@]}"
++cp "$BUILD/libdxmt_combined.a" "$OUT"
+diff --git a/scripts/build/build-fex-ios.sh b/scripts/build/build-fex-ios.sh
+new file mode 100755
+index 0000000..3ad066d
+--- /dev/null
++++ b/scripts/build/build-fex-ios.sh
+@@ -0,0 +1,54 @@
++#!/usr/bin/env bash
++set -euo pipefail
++ROOT="${ROOT:-$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)}"
++JOBS="${JOBS:-$(sysctl -n hw.ncpu 2>/dev/null || echo 8)}"
++SRC="$ROOT/FEX"
++BUILD="$SRC/build-ios"
++OUT="$BUILD/FEXCore/Source/libFEXCore.a"
++
++if [[ -f "$OUT" && -f "$BUILD/FEXCore/Source/libJemallocLibs.a" ]]; then
++  echo "FEX iOS: cached"
++  exit 0
++fi
++
++# Options mirror build/fex-ios/build.sh. Do not define FEX_IOS_HOST here: in
++# this FEX fork it selects the code for FEX running as a Windows PE under Wine
++# on iOS (xtajit.dll, xtajit64.dll), which calls Win32 APIs and symbols that
++# only those modules define. The native library the app links uses __APPLE__.
++
++# fex-ios.patch makes the pinned FEX compile and link for this target:
++# - Arm64.cpp: IosLogUnimplementedCASPAL dumps a Win32 VirtualQuery region;
++#   keep the log line, drop the dump.
++# - AllocatorHooks.cpp: IOS_RPM_GUARD() is used in the ENABLE_FEX_ALLOCATOR=OFF
++#   branch but only defined when the allocator is on; it is a no-op there.
++# - Core.cpp: the [ffs-bypass]/[cb-entry] reporters read counters declared only
++#   under FEX_IOS_HOST, and rpm_cas_snapshot_take lives in FEX's rpmalloc fork,
++#   which is not linked with the allocator off (weak stub, reports nothing).
++if ! git -C "$SRC" apply --reverse --check "$ROOT/scripts/build/fex-ios.patch" 2>/dev/null; then
++  git -C "$SRC" apply "$ROOT/scripts/build/fex-ios.patch"
++fi
++
++cmake -S "$SRC" -B "$BUILD" -G Ninja \
++  -DCMAKE_SYSTEM_NAME=iOS \
++  -DCMAKE_SYSTEM_PROCESSOR=arm64 \
++  -DCMAKE_OSX_SYSROOT=iphoneos \
++  -DCMAKE_OSX_ARCHITECTURES=arm64 \
++  -DCMAKE_OSX_DEPLOYMENT_TARGET=17.0 \
++  -DCMAKE_BUILD_TYPE=Release \
++  -DBUILD_TESTING=OFF \
++  -DBUILD_FEX_LINUX_TESTS=OFF \
++  -DBUILD_THUNKS=OFF \
++  -DBUILD_FEXCONFIG=OFF \
++  -DBUILD_STEAM_SUPPORT=OFF \
++  -DENABLE_FEX_ALLOCATOR=OFF \
++  -DENABLE_ASSERTIONS=OFF \
++  -DENABLE_LTO=OFF \
++  -DENABLE_CCACHE=OFF \
++  -DTUNE_CPU=generic \
++  -DTUNE_ARCH=generic
++
++# The Xcode project links these archives from FEX/build-ios.
++cmake --build "$BUILD" --target FEXCore FEXCore_Base JemallocLibs --parallel "$JOBS"
++for lib in "$OUT" "$BUILD/FEXCore/Source/libJemallocLibs.a"; do
++  [[ -f "$lib" ]] || { echo "ERROR: FEX build did not produce $lib" >&2; exit 1; }
++done
+diff --git a/scripts/build/build-freetype-ios.sh b/scripts/build/build-freetype-ios.sh
+new file mode 100755
+index 0000000..b649304
+--- /dev/null
++++ b/scripts/build/build-freetype-ios.sh
+@@ -0,0 +1,17 @@
++#!/usr/bin/env bash
++set -euo pipefail
++ROOT="${ROOT:-$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)}"
++SRC="$ROOT/research/freetype"
++OUT="$ROOT/build/freetype-ios/build/libfreetype.a"
++
++if [[ -f "$OUT" ]]; then
++  echo "FreeType iOS: cached"
++  exit 0
++fi
++
++if [[ ! -d "$SRC/.git" ]]; then
++  rm -rf "$SRC"
++  git clone --depth 1 --branch VER-2-13-3 https://github.com/freetype/freetype.git "$SRC"
++fi
++
++bash "$ROOT/build/freetype-ios/build.sh"
+diff --git a/scripts/build/build-llvm-ios.sh b/scripts/build/build-llvm-ios.sh
+new file mode 100755
+index 0000000..ec3b0e8
+--- /dev/null
++++ b/scripts/build/build-llvm-ios.sh
+@@ -0,0 +1,66 @@
++#!/usr/bin/env bash
++set -euo pipefail
++ROOT="${ROOT:-$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)}"
++JOBS="${JOBS:-$(sysctl -n hw.ncpu 2>/dev/null || echo 8)}"
++SRC="$ROOT/toolchains/llvm-project"
++HOST="$ROOT/toolchains/llvm-host-build"
++IOS="$ROOT/toolchains/llvm-ios-build"
++TAG=llvmorg-15.0.7
++
++if compgen -G "$IOS/lib/libLLVM*.a" >/dev/null; then
++  echo "LLVM iOS: cached"
++  exit 0
++fi
++
++mkdir -p "$ROOT/toolchains"
++if [[ ! -d "$SRC/.git" ]]; then
++  git clone --depth 1 --branch "$TAG" https://github.com/llvm/llvm-project.git "$SRC"
++fi
++
++# Apple ld does not accept --gc-sections. DXMT's documented iOS build requires
++# AddLLVM.cmake to treat iOS like Darwin and use -dead_strip in every check, not only the first.
++python3 - "$SRC/llvm/cmake/modules/AddLLVM.cmake" <<'PY'
++from pathlib import Path
++import sys
++p = Path(sys.argv[1])
++s = p.read_text()
++if 'MATCHES "Darwin|iOS"' not in s:
++    old = 'MATCHES "Darwin"'
++    if old not in s:
++        raise SystemExit(f"expected pattern not found in {p}")
++    p.write_text(s.replace(old, 'MATCHES "Darwin|iOS"'))
++PY
++
++if [[ ! -x "$HOST/bin/llvm-tblgen" ]]; then
++  cmake -S "$SRC/llvm" -B "$HOST" -G Ninja \
++    -DCMAKE_BUILD_TYPE=Release \
++    -DLLVM_INCLUDE_TESTS=OFF \
++    -DLLVM_INCLUDE_EXAMPLES=OFF \
++    -DLLVM_INCLUDE_BENCHMARKS=OFF \
++    -DLLVM_ENABLE_TERMINFO=OFF \
++    -DLLVM_ENABLE_ZLIB=OFF
++  cmake --build "$HOST" --target llvm-tblgen --parallel "$JOBS"
++fi
++
++cmake -S "$SRC/llvm" -B "$IOS" -G Ninja \
++  -DCMAKE_SYSTEM_NAME=iOS \
++  -DCMAKE_OSX_SYSROOT=iphoneos \
++  -DCMAKE_OSX_ARCHITECTURES=arm64 \
++  -DCMAKE_OSX_DEPLOYMENT_TARGET=18.0 \
++  -DCMAKE_BUILD_TYPE=Release \
++  -DLLVM_TABLEGEN="$HOST/bin/llvm-tblgen" \
++  -DLLVM_BUILD_UTILS=OFF \
++  -DLLVM_BUILD_TOOLS=OFF \
++  -DLLVM_INCLUDE_TOOLS=OFF \
++  -DLLVM_INCLUDE_TESTS=OFF \
++  -DLLVM_INCLUDE_EXAMPLES=OFF \
++  -DLLVM_INCLUDE_BENCHMARKS=OFF \
++  -DLLVM_ENABLE_TERMINFO=OFF \
++  -DLLVM_ENABLE_ZLIB=OFF \
++  -DLLVM_TARGETS_TO_BUILD=""
++
++cmake --build "$IOS" --parallel "$JOBS"
++compgen -G "$IOS/lib/libLLVM*.a" >/dev/null || {
++  echo "ERROR: LLVM iOS build produced no static LLVM libraries" >&2
++  exit 1
++}
+diff --git a/scripts/build/build-shader-headers.sh b/scripts/build/build-shader-headers.sh
+new file mode 100755
+index 0000000..a0971ac
+--- /dev/null
++++ b/scripts/build/build-shader-headers.sh
+@@ -0,0 +1,40 @@
++#!/usr/bin/env bash
++# Compile DXMT's .metal airconv shaders to .air and embed them as C headers.
++# The DXMT meson flow does this via its metalir/hexdump generators; the iOS
++# static-library flow consumes the headers directly, so this step reproduces
++# that generation with the same compiler, flags, and xxd embedding.
++set -euo pipefail
++ROOT="${ROOT:-$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)}"
++SRC="$ROOT/dxmt/src/airconv/shaders"
++OUT="$ROOT/build/dxmt-ios/shader-headers"
++SHADERS=(air_msad air_samplepos air_tessellation)
++
++# Metal toolchain 32023 (Xcode 27) gave __metal_atomic_fetch_add_explicit a fifth
++# memory-flags argument. Pass it when the toolchain defines it.
++python3 - "$SRC/air_tessellation.metal" <<'PY'
++import sys
++from pathlib import Path
++p = Path(sys.argv[1])
++s = p.read_text()
++old = "  return __metal_atomic_fetch_add_explicit(out_count, 1, int(memory_order_relaxed), __METAL_MEMORY_SCOPE_THREADGROUP__);\n"
++if "__METAL_MEMORY_FLAGS_NONE__" not in s:
++    if old not in s:
++        raise SystemExit(f"expected atomic call not found in {p}")
++    new = ("#ifdef __METAL_MEMORY_FLAGS_NONE__\n"
++           + old.replace("__);", "__, __METAL_MEMORY_FLAGS_NONE__);")
++           + "#else\n" + old + "#endif\n")
++    p.write_text(s.replace(old, new, 1))
++PY
++
++for name in "${SHADERS[@]}"; do
++  if [[ -f "$OUT/$name.h" && -f "$OUT/$name.air" ]]; then
++    echo "shader $name: cached"
++    continue
++  fi
++  [[ -f "$SRC/$name.metal" ]] || { echo "ERROR: missing shader source $SRC/$name.metal (is the dxmt submodule checked out?)" >&2; exit 1; }
++  echo "shader $name: compiling"
++  mkdir -p "$OUT"
++  xcrun -sdk macosx metal -o "$OUT/$name.air" -c "$SRC/$name.metal" \
++    -std=metal3.1 --target=air64-apple-macos14.0
++  xxd -n "$name" -i "$OUT/$name.air" "$OUT/$name.h"
++done
+diff --git a/scripts/build/build-wine.sh b/scripts/build/build-wine.sh
+new file mode 100755
+index 0000000..7e6405a
+--- /dev/null
++++ b/scripts/build/build-wine.sh
+@@ -0,0 +1,50 @@
++#!/usr/bin/env bash
++set -euo pipefail
++ROOT="${ROOT:-$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)}"
++JOBS="${JOBS:-$(sysctl -n hw.ncpu 2>/dev/null || echo 8)}"
++WINE="$ROOT/wine"
++MINGW="$ROOT/toolchains/llvm-mingw-20260421-ucrt-macos-universal/bin"
++export PATH="$MINGW:$PATH"
++
++[[ -x "$WINE/configure" ]] || { echo "ERROR: wine submodule is missing" >&2; exit 1; }
++
++# Native macOS build tree. Madeira's iOS unix-side libraries consume config.h,
++# generated headers, and host build outputs from here. aarch64 is the native
++# PE architecture used by the tracked Wine/DXMT side.
++if [[ ! -f "$WINE/build-macos/Makefile" ]]; then
++  echo "Configuring Wine (macOS/aarch64)..."
++  mkdir -p "$WINE/build-macos"
++  (
++    cd "$WINE/build-macos"
++    ../configure --enable-archs=aarch64 --disable-tests
++  )
++fi
++
++# The iOS static libraries only consume config.h, the build tools and the
++# widl-generated headers, so build just those instead of every PE module.
++if [[ ! -f "$WINE/build-macos/include/dwrite.h" || ! -x "$WINE/build-macos/tools/winebuild/winebuild" ]]; then
++  echo "Building Wine host tools and headers..."
++  make -C "$WINE/build-macos" -j"$JOBS" tools/all tools/widl/all tools/winebuild/all include/all
++else
++  echo "Wine host tree: cached"
++fi
++
++# Madeira's ntdll iOS build currently includes generated dwrite headers from a
++# directory named build-arm64ec. Configure that tree reproducibly and build only
++# the generated headers required by the iOS static libraries; PE binaries are
++# already versioned by Madeira and are not rebuilt during onboarding.
++if [[ ! -f "$WINE/build-arm64ec/Makefile" ]]; then
++  echo "Configuring Wine (ARM64EC headers)..."
++  mkdir -p "$WINE/build-arm64ec"
++  (
++    cd "$WINE/build-arm64ec"
++    ../configure --enable-archs=arm64ec --without-x --disable-tests --enable-winegstreamer
++  )
++fi
++
++if [[ ! -f "$WINE/build-arm64ec/include/dwrite.h" || ! -f "$WINE/build-arm64ec/include/dwrite_3.h" ]]; then
++  echo "Generating Wine ARM64EC headers..."
++  make -C "$WINE/build-arm64ec" -j"$JOBS" include/dwrite.h include/dwrite_3.h
++else
++  echo "Wine ARM64EC headers: cached"
++fi
+diff --git a/scripts/build/fex-ios.patch b/scripts/build/fex-ios.patch
+new file mode 100644
+index 0000000..5356ce8
+--- /dev/null
++++ b/scripts/build/fex-ios.patch
+@@ -0,0 +1,51 @@
++diff --git a/FEXCore/Source/Interface/Core/Core.cpp b/FEXCore/Source/Interface/Core/Core.cpp
++index be5431125..4c279239a 100644
++--- a/FEXCore/Source/Interface/Core/Core.cpp
+++++ b/FEXCore/Source/Interface/Core/Core.cpp
++@@ -76,6 +76,7 @@ struct rpm_cas_snapshot {
++   unsigned int block_count, block_used, is_full, which_loop;
++ };
++ int rpm_cas_snapshot_take(struct rpm_cas_snapshot* out);
+++__attribute__((weak)) int rpm_cas_snapshot_take(struct rpm_cas_snapshot*) { return 0; }
++ }
++ #include <condition_variable>
++ #include <fcntl.h>
++@@ -1488,6 +1489,7 @@ uintptr_t ContextImpl::CompileBlock(FEXCore::Core::CpuStateFrame* Frame, uint64_
++    * reached via its x64 fast-forward sequence -- preserves the x4/x5 varargs contract that
++    * the emulation round trip destroys; see Module.S). Same change-detection pattern as
++    * [cb-entry] below: CompileBlock runs often enough to notice promptly. */
+++#ifdef FEX_IOS_HOST
++   {
++     static uint64_t FfsLastCount = 0;
++     static uint32_t FfsReports = 0;
++@@ -1514,6 +1516,7 @@ uintptr_t ContextImpl::CompileBlock(FEXCore::Core::CpuStateFrame* Frame, uint64_
++                         IosCbEntryLog[4], IosCbEntryLog[5], IosCbEntryLog[7]);
++     }
++   }
+++#endif
++ 
++   /* iOS-Madeira: refuse to compile obviously-invalid guest RIPs. After a
++    * NULL-vtable virtual call (`call [rax+8]` with rax=0), control flow
++diff --git a/FEXCore/Source/Utils/ArchHelpers/Arm64.cpp b/FEXCore/Source/Utils/ArchHelpers/Arm64.cpp
++index b2eca70f8..695d78ad0 100644
++--- a/FEXCore/Source/Utils/ArchHelpers/Arm64.cpp
+++++ b/FEXCore/Source/Utils/ArchHelpers/Arm64.cpp
++@@ -704,16 +704,8 @@ static void IosLogUnimplementedCASPAL(uint32_t Size, uint64_t* GPRs, uint32_t Ad
++    * which we DUAL-MAP (RW alias + RX alias). Aliased mappings are exactly where atomics
++    * can fault despite correct alignment. Report what the region actually is, so "guest
++    * data in a dual-mapped pool page" is distinguishable from ordinary private memory. */
++-  MEMORY_BASIC_INFORMATION mbi {};
++-  const char* type = "?";
++-  if (VirtualQuery(reinterpret_cast<LPCVOID>(GPRs[AddressReg]), &mbi, sizeof(mbi))) {
++-    type = mbi.Type == MEM_IMAGE ? "MEM_IMAGE" : mbi.Type == MEM_MAPPED ? "MEM_MAPPED" : "MEM_PRIVATE";
++-  }
++-  LogMan::Msg::EFmt("[caspal128] MISALIGNED-UNSUPPORTED Size={} addrReg=x{} addr={:#x} misalign={} "
++-                    "crosses16B={} | region base={} size={:#x} prot={:#x} type={} state={:#x}",
++-                    Size, AddressReg, GPRs[AddressReg], GPRs[AddressReg] & 15,
++-                    (GPRs[AddressReg] & 15) ? "yes" : "no", mbi.BaseAddress, mbi.RegionSize,
++-                    mbi.Protect, type, mbi.State);
+++  LogMan::Msg::EFmt("[caspal128] MISALIGNED-UNSUPPORTED Size={} addrReg=x{} addr={:#x} misalign={}",
+++                    Size, AddressReg, GPRs[AddressReg], GPRs[AddressReg] & 15);
++ }
++ 
++ static bool HandleCASPAL(uint32_t Instr, uint64_t* GPRs, uint32_t* StrictSplitLockMutex) {
+diff --git a/scripts/build/setup-llvm-mingw.sh b/scripts/build/setup-llvm-mingw.sh
+new file mode 100755
+index 0000000..549f8c7
+--- /dev/null
++++ b/scripts/build/setup-llvm-mingw.sh
+@@ -0,0 +1,20 @@
++#!/usr/bin/env bash
++set -euo pipefail
++ROOT="${ROOT:-$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)}"
++VERSION=20260421
++NAME="llvm-mingw-${VERSION}-ucrt-macos-universal"
++DEST="$ROOT/toolchains/$NAME"
++URL="https://github.com/mstorsjo/llvm-mingw/releases/download/${VERSION}/${NAME}.tar.xz"
++
++if [[ -x "$DEST/bin/aarch64-w64-mingw32-clang" && -x "$DEST/bin/arm64ec-w64-mingw32-clang" ]]; then
++  echo "llvm-mingw: cached"
++  exit 0
++fi
++
++mkdir -p "$ROOT/toolchains"
++echo "Downloading llvm-mingw $VERSION..."
++curl -fL "$URL" | tar -xJ -C "$ROOT/toolchains"
++[[ -x "$DEST/bin/arm64ec-w64-mingw32-clang" ]] || {
++  echo "ERROR: llvm-mingw archive does not contain arm64ec-w64-mingw32-clang" >&2
++  exit 1
++}
+diff --git a/scripts/build/sync-gnutls-libs.sh b/scripts/build/sync-gnutls-libs.sh
+new file mode 100755
+index 0000000..d1f83f4
+--- /dev/null
++++ b/scripts/build/sync-gnutls-libs.sh
+@@ -0,0 +1,16 @@
++#!/usr/bin/env bash
++# Copy the freshly built GnuTLS stack into app/Madeira/, where the Xcode
++# project links it. The repo carries previously built copies of these four
++# archives so a plain xcodebuild works, but a clean-clone build must refresh
++# them from the toolchain this script chain just compiled.
++set -euo pipefail
++ROOT="${ROOT:-$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)}"
++SRC="$ROOT/toolchains/gnutls-ios/lib"
++DEST="$ROOT/app/Madeira"
++LIBS=(libgmp.a libnettle.a libhogweed.a libgnutls.a)
++
++for lib in "${LIBS[@]}"; do
++  [[ -f "$SRC/$lib" ]] || { echo "ERROR: missing $SRC/$lib; run build/gnutls-ios/build.sh first" >&2; exit 1; }
++  cp "$SRC/$lib" "$DEST/$lib"
++done
++echo "GnuTLS libraries: synced to $DEST"
+diff --git a/tests/host/jit-legacy-test.c b/tests/host/jit-legacy-test.c
+new file mode 100644
+index 0000000..93b8396
+--- /dev/null
++++ b/tests/host/jit-legacy-test.c
+@@ -0,0 +1,100 @@
++/* Test the actual legacy allocator with deterministic Mach failures.
++ * cc -std=c11 -Wall -Wextra -Werror tests/host/jit-legacy-test.c -o /tmp/jit-test
++ */
++#include <assert.h>
++#include <stdbool.h>
++#include <stdint.h>
++#include <stddef.h>
++#include <stdio.h>
++
++typedef uintptr_t vm_address_t;
++typedef size_t vm_size_t;
++typedef int kern_return_t;
++typedef int mach_port_t;
++typedef unsigned mach_msg_type_number_t;
++typedef int *vm_region_info_t;
++typedef struct { int protection, max_protection; } vm_region_basic_info_data_64_t;
++enum { KERN_SUCCESS = 0, FALSE = 0, VM_FLAGS_ANYWHERE = 1,
++       MACH_PORT_NULL = 0, VM_PROT_READ = 1, VM_PROT_WRITE = 2,
++       VM_PROT_EXECUTE = 4, VM_PROT_ALL = 7, VM_REGION_BASIC_INFO_64 = 9,
++       VM_REGION_BASIC_INFO_COUNT_64 = 2, JIT_PAGE_SIZE = 0x4000 };
++
++static int fail_alloc, fail_protect, fail_query, stripped, no_max_write;
++static int allocations, protections, frees, port_frees, invalidations;
++static size_t mapped_size;
++static vm_address_t mapped_base;
++static bool coalesced;
++static void jit_log(const char *fmt, ...) { (void)fmt; }
++static mach_port_t mach_task_self(void) { return 1; }
++static kern_return_t vm_allocate(mach_port_t t, vm_address_t *a, size_t s, int f) {
++    (void)t; assert(f == VM_FLAGS_ANYWHERE); allocations++;
++    if (fail_alloc) return 3;
++    *a = mapped_base = 0x150000000; mapped_size = s; return 0;
++}
++static kern_return_t vm_protect(mach_port_t t, vm_address_t a, size_t s, int max, int p) {
++    (void)t; assert(a == mapped_base); assert(s == mapped_size); assert(!max);
++    assert(p == VM_PROT_ALL || p == (VM_PROT_READ | VM_PROT_EXECUTE));
++    protections++;
++    return protections == fail_protect ? 2 : 0;
++}
++static kern_return_t vm_region_64(mach_port_t t, vm_address_t *a, vm_size_t *s,
++                                 int flavor, vm_region_info_t out,
++                                 mach_msg_type_number_t *n, mach_port_t *obj) {
++    (void)t; (void)flavor; (void)n;
++    if (fail_query) return 5;
++    vm_region_basic_info_data_64_t *info = (void *)out;
++    info->protection = VM_PROT_READ | (stripped ? 0 : VM_PROT_EXECUTE);
++    info->max_protection = no_max_write ? 5 : VM_PROT_ALL;
++    *s = mapped_size;
++    if (coalesced) { *a -= JIT_PAGE_SIZE; *s += JIT_PAGE_SIZE; }
++    *obj = 42; return 0;
++}
++static kern_return_t mach_port_deallocate(mach_port_t t, mach_port_t p) {
++    (void)t; assert(p == 42); port_frees++; return 0;
++}
++static kern_return_t vm_deallocate(mach_port_t t, vm_address_t a, size_t s) {
++    (void)t; assert(a == mapped_base); assert(s == mapped_size); frees++; return 0;
++}
++static void sys_icache_invalidate(void *a, size_t s) {
++    assert((uintptr_t)a == mapped_base); assert(s == mapped_size); invalidations++;
++}
++#include "../../app/Madeira/JITLegacy.h"
++
++static void reset(void) {
++    fail_alloc = fail_protect = fail_query = stripped = no_max_write = 0;
++    allocations = protections = frees = port_frees = invalidations = 0;
++    coalesced = false; mapped_base = 0x150000000; mapped_size = JIT_PAGE_SIZE;
++}
++int main(void) {
++    reset();
++    assert(jit_legacy_prepare_region(NULL, 1) == (void *)mapped_base);
++    assert(mapped_size == JIT_PAGE_SIZE && protections == 2 && !frees);
++    assert(port_frees == 1 && invalidations == 1);
++    reset(); coalesced = true;
++    assert(jit_legacy_prepare_region(NULL, 0x4001));
++    assert(mapped_size == 0x8000);
++    reset();
++    assert(!jit_legacy_prepare_region(NULL, 0));
++    assert(!jit_legacy_prepare_region(NULL, SIZE_MAX));
++    assert(!jit_legacy_prepare_region((void *)1, 1));
++    assert(!jit_legacy_prepare_region((void *)(UINTPTR_MAX & ~(uintptr_t)0x3fff), 0x4000));
++    assert(!allocations && !protections);
++    reset(); fail_alloc = 1;
++    assert(!jit_legacy_prepare_region(NULL, 1)); assert(!frees && !protections);
++    for (int stage = 1; stage <= 2; stage++) {
++        reset(); fail_protect = stage;
++        assert(!jit_legacy_prepare_region(NULL, 1)); assert(frees == 1);
++    }
++    reset(); fail_query = 1;
++    assert(!jit_legacy_prepare_region(NULL, 1)); assert(frees == 1 && !port_frees);
++    reset(); stripped = 1;
++    assert(!jit_legacy_prepare_region(NULL, 1)); assert(frees == 1 && port_frees == 1);
++    reset(); no_max_write = 1;
++    assert(!jit_legacy_prepare_region(NULL, 1)); assert(frees == 1 && !invalidations);
++    reset();
++    assert(jit_legacy_prepare_region((void *)mapped_base, 1));
++    assert(!allocations && protections == 1 && !frees);
++    reset(); fail_protect = 1;
++    assert(!jit_legacy_prepare_region((void *)mapped_base, 1)); assert(!frees);
++    puts("legacy allocator: all allocation, validation and rollback tests passed");
++}
